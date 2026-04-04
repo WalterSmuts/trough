@@ -164,7 +164,10 @@ fn noise(mut spectrum_setup: impl FnMut(&mut [Complex<f64>])) -> Result<(), std:
             for (hz, bin) in pos.iter_mut().enumerate().skip(1) {
                 *bin *= Complex::from_polar(
                     1.,
-                    rng.random::<f64>() * (hz as f64 / 22050.) * std::f64::consts::FRAC_PI_2,
+                    rng.random::<f64>()
+                        * (hz as f64 / MAX_FREQUENCY as f64)
+                        * std::f64::consts::FRAC_PI_2
+                        - std::f64::consts::FRAC_PI_4,
                 );
             }
         }
