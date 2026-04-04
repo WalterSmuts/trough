@@ -89,54 +89,51 @@ fn parse_args() -> Result<Args, lexopt::Error> {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = parse_args()?;
     let mut rng = rand::rng();
+
+    // Target RMS for the time-domain output. This sets the overall volume for
+    // all noise colors equally — each closure below only defines the spectral
+    // *shape*, and `noise()` normalizes the spectrum to hit this RMS.
+    //
+    // With avg_amplitude = 8 and 22049 positive-frequency bins, this matches
+    // the historical white noise level (~5% of i16 full-scale).
     let avg_amplitude = 8.;
+    let num_positive_bins = (SAMPLES_PER_SECOND / 2 - 1) as f64;
+    let target_rms = avg_amplitude * (2.0 * num_positive_bins).sqrt();
+
     match args.color {
-        Color::White => noise(args.duration, |spectrum| {
+        Color::White => noise(args.duration, target_rms, |spectrum| {
             for bin in spectrum {
-                *bin =
-                    Complex::from_polar(avg_amplitude, rng.random::<f64>() * std::f64::consts::TAU);
+                *bin = Complex::from_polar(1., rng.random::<f64>() * std::f64::consts::TAU);
             }
         })?,
-        Color::Pink => noise(args.duration, |spectrum| {
-            let normalization = avg_amplitude * f64::sqrt(MAX_FREQUENCY as f64 / 2.);
-            let power = normalization.powi(2);
+        Color::Pink => noise(args.duration, target_rms, |spectrum| {
             for (hz, bin) in spectrum.iter_mut().enumerate().skip(20) {
                 *bin = Complex::from_polar(
-                    (power / (hz + 1) as f64).sqrt(),
+                    1. / ((hz + 1) as f64).sqrt(),
                     rng.random::<f64>() * std::f64::consts::TAU,
                 );
             }
         })?,
-        Color::Brownian => noise(args.duration, |spectrum| {
-            // TODO: normalize this (and everything) by computing area under the curve of
-            // amplitudes (maybe of power density instead?) and normalizing that to a particular
-            // number. you know, instead of eyeballing "brownian is ~4x quieter than pink".
-            let pink_normalization = avg_amplitude * f64::sqrt(MAX_FREQUENCY as f64 / 2.) * 4.;
-            let pink_power = pink_normalization.powi(2);
-            let pink_max_amplitude = (pink_power / 20.).sqrt();
+        Color::Brownian => noise(args.duration, target_rms, |spectrum| {
             for (hz, bin) in spectrum.iter_mut().enumerate().skip(20) {
                 *bin = Complex::from_polar(
-                    ((1. / ((hz + 1) as f64)) / (1. / ((20 + 1) as f64))) * pink_max_amplitude,
+                    1. / (hz + 1) as f64,
                     rng.random::<f64>() * std::f64::consts::TAU,
                 );
             }
         })?,
-        Color::Blue => noise(args.duration, |spectrum| {
-            let normalization = avg_amplitude / f64::sqrt(MAX_FREQUENCY as f64 / 2.);
-            let power = normalization.powi(2);
+        Color::Blue => noise(args.duration, target_rms, |spectrum| {
             for (hz, bin) in spectrum.iter_mut().enumerate() {
                 *bin = Complex::from_polar(
-                    (power * (hz + 1) as f64).sqrt(),
+                    ((hz + 1) as f64).sqrt(),
                     rng.random::<f64>() * std::f64::consts::TAU,
                 );
             }
         })?,
-        Color::Violet => noise(args.duration, |spectrum| {
-            let normalization = avg_amplitude / f64::sqrt(MAX_FREQUENCY as f64 / 2.) / 4.;
-            let power = normalization.powi(2);
+        Color::Violet => noise(args.duration, target_rms, |spectrum| {
             for (hz, bin) in spectrum.iter_mut().enumerate() {
                 *bin = Complex::from_polar(
-                    power * (hz + 1) as f64,
+                    (hz + 1) as f64,
                     rng.random::<f64>() * std::f64::consts::TAU,
                 );
             }
@@ -152,16 +149,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         * (hz.powi(2) + (12194.0f64).powi(2)))
             };
             let ra1000 = r_a(1000.);
-            noise(args.duration, |spectrum| {
+            noise(args.duration, target_rms, |spectrum| {
                 for (hz, bin) in spectrum.iter_mut().enumerate().skip(20) {
                     // hz is 0-indexed within the closure, but the closure receives
                     // bins starting at frequency 1, so actual frequency is hz + 1.
-                    let a_in_db =
-                        20. * r_a((hz + 1) as f64).log10() - 20. * ra1000.log10();
-                    let avg_in_db = 20. * avg_amplitude.log10();
-                    let target_in_db = avg_in_db - a_in_db;
-                    let a = 10.0f64.powf(target_in_db / 20.);
-                    *bin = Complex::from_polar(a, rng.random::<f64>() * std::f64::consts::TAU);
+                    let a_weight = r_a((hz + 1) as f64) / ra1000;
+                    *bin = Complex::from_polar(
+                        1. / a_weight,
+                        rng.random::<f64>() * std::f64::consts::TAU,
+                    );
                 }
             })?
         }
@@ -172,6 +168,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn noise(
     duration_in_seconds: u32,
+    target_rms: f64,
     mut spectrum_setup: impl FnMut(&mut [Complex<f64>]),
 ) -> Result<(), std::io::Error> {
     let sample_data_len = AVG_BYTES_PER_SECOND * duration_in_seconds;
@@ -215,6 +212,22 @@ fn noise(
         if interval == 0 {
             spectrum_setup(&mut pos[1..]);
             pos[0] = Complex::ZERO;
+
+            // Normalize the spectrum so all noise colors produce the same RMS
+            // output regardless of spectral shape. By Parseval's theorem (for
+            // RustFFT's unnormalized IFFT with conjugate symmetry):
+            //
+            //     RMS = sqrt(2 × Σ |A(k)|²)
+            //
+            // We scale all bins by (target_rms / current_rms). This only runs
+            // on the first interval because subsequent intervals preserve bin
+            // magnitudes (phase-only evolution).
+            let energy: f64 = pos[1..].iter().map(|c| c.norm_sqr()).sum::<f64>() * 2.0;
+            let current_rms = energy.sqrt();
+            let scale = target_rms / current_rms;
+            for bin in pos[1..].iter_mut() {
+                *bin *= scale;
+            }
         } else {
             for (hz, bin) in pos.iter_mut().enumerate().skip(1) {
                 *bin *= Complex::from_polar(
