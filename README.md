@@ -31,4 +31,6 @@ abstractions, just reading specs and working through the math by hand.
 Topics covered include the RIFF/WAVE file format, PCM audio encoding,
 colored noise theory, and inverse FFT-based synthesis.
 
+The stream ended at 33623289870346696724769cded6dc2bbb07fc1d.
+
 [stream]: https://youtu.be/zOTE4BN59u4
