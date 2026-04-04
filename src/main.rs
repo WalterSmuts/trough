@@ -52,6 +52,20 @@ struct Args {
     duration: u32,
 }
 
+/// IEC 61672-1 A-weighting relative response at a given frequency.
+///
+/// Returns `R_A(hz)` in linear scale (not dB). The result is approximately 1.0
+/// at 1000 Hz by the standard's convention. Used both for grey noise spectral
+/// shaping (inverse A-weighting) and for A-weighted loudness normalization.
+///
+/// https://en.wikipedia.org/wiki/A-weighting
+fn r_a(hz: f64) -> f64 {
+    ((12194.0f64).powi(2) * hz.powi(4))
+        / ((hz.powi(2) + 20.6f64.powi(2))
+            * f64::sqrt((hz.powi(2) + 107.7f64.powi(2)) * (hz.powi(2) + 737.9f64.powi(2)))
+            * (hz.powi(2) + (12194.0f64).powi(2)))
+}
+
 fn parse_args() -> Result<Args, lexopt::Error> {
     use lexopt::prelude::*;
 
@@ -90,12 +104,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = parse_args()?;
     let mut rng = rand::rng();
 
-    // Target RMS for the time-domain output. This sets the overall volume for
-    // all noise colors equally — each closure below only defines the spectral
-    // *shape*, and `noise()` normalizes the spectrum to hit this RMS.
+    // Target A-weighted RMS for the time-domain output. Each closure below
+    // defines only the spectral *shape*, and `noise()` normalizes the spectrum
+    // so that its A-weighted energy matches this target — making all colors
+    // sound approximately equally loud regardless of spectral tilt.
     //
     // With avg_amplitude = 8 and 22049 positive-frequency bins, this matches
-    // the historical white noise level (~5% of i16 full-scale).
+    // the historical white noise level (~5% of i16 full-scale). Colors with
+    // energy concentrated where hearing is insensitive (brownian, grey) need
+    // much higher physical RMS to match, and may approach i16 clipping at this
+    // target. Reduce `avg_amplitude` if clipping is observed.
     let avg_amplitude = 8.;
     let num_positive_bins = (SAMPLES_PER_SECOND / 2 - 1) as f64;
     let target_rms = avg_amplitude * (2.0 * num_positive_bins).sqrt();
@@ -139,15 +157,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         })?,
         Color::Grey => {
-            // https://en.wikipedia.org/wiki/A-weighting
-            let r_a = |hz: f64| {
-                ((12194.0f64).powi(2) * hz.powi(4))
-                    / ((hz.powi(2) + 20.6f64.powi(2))
-                        * f64::sqrt(
-                            (hz.powi(2) + 107.7f64.powi(2)) * (hz.powi(2) + 737.9f64.powi(2)),
-                        )
-                        * (hz.powi(2) + (12194.0f64).powi(2)))
-            };
             let ra1000 = r_a(1000.);
             noise(args.duration, target_rms, |spectrum| {
                 for (hz, bin) in spectrum.iter_mut().enumerate().skip(20) {
@@ -213,17 +222,28 @@ fn noise(
             spectrum_setup(&mut pos[1..]);
             pos[0] = Complex::ZERO;
 
-            // Normalize the spectrum so all noise colors produce the same RMS
-            // output regardless of spectral shape. By Parseval's theorem (for
-            // RustFFT's unnormalized IFFT with conjugate symmetry):
+            // Normalize so all noise colors are perceptually equally loud,
+            // using A-weighted energy. By Parseval's theorem for RustFFT's
+            // unnormalized IFFT with conjugate symmetry, the raw time-domain
+            // RMS is `sqrt(2 × Σ |A(k)|²)`. We apply the same formula but
+            // weight each bin's energy by the square of its A-weighting factor
+            // (energy = amplitude², so weighting amplitude by W means weighting
+            // energy by W²), then scale all bins so this A-weighted RMS matches
+            // the target.
             //
-            //     RMS = sqrt(2 × Σ |A(k)|²)
-            //
-            // We scale all bins by (target_rms / current_rms). This only runs
-            // on the first interval because subsequent intervals preserve bin
-            // magnitudes (phase-only evolution).
-            let energy: f64 = pos[1..].iter().map(|c| c.norm_sqr()).sum::<f64>() * 2.0;
-            let current_rms = energy.sqrt();
+            // This only runs on the first interval because subsequent intervals
+            // preserve bin magnitudes (phase-only evolution).
+            let ra1000 = r_a(1000.);
+            let a_weighted_energy: f64 = pos[1..]
+                .iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    let w = r_a((i + 1) as f64) / ra1000;
+                    c.norm_sqr() * w * w
+                })
+                .sum::<f64>()
+                * 2.0;
+            let current_rms = a_weighted_energy.sqrt();
             let scale = target_rms / current_rms;
             for bin in pos[1..].iter_mut() {
                 *bin *= scale;
